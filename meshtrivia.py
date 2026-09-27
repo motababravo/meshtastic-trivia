@@ -1,0 +1,1057 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Meshtastic Trivia Bot
+Version: 3.9
+"""
+
+import time
+import json
+import os
+from datetime import datetime, date
+import random
+from pubsub import pub
+from meshtastic.serial_interface import SerialInterface
+from meshtastic.tcp_interface import TCPInterface
+from typing import Dict, Optional, List
+import threading
+import string
+from confusables import is_confusable
+
+# ── Connection Configuration ───────────────────────────────────────────────────
+CONNECTION_TYPE = "tcp"          # "tcp" or "serial"
+NODE_IP = "192.168.78.58"        # Meshtastic node IP
+SERIAL_PORT = "/dev/ttyUSB0"     # Serial port (if using serial)
+CHANNEL_INDEX = 0                # Primary channel
+STATS_FILE = "trivia_stats.json"
+META_FILE = "trivia_meta.json"   # Tracks month-of-last-scoreboard-reset (survives restarts)
+
+# ── Monthly Scoreboard Reset ───────────────────────────────────────────────────
+MONTHLY_RESET_ENABLED = True     # Reset the leaderboard on the 1st of every month
+
+# ── Message splitting ──────────────────────────────────────────────────────────
+# Meshtastic's real transmission limit is on BYTES, not characters (usable
+# application payload is ~200 bytes; Cyrillic chars are 2 bytes each in UTF-8,
+# so a 200-*character* Cyrillic message can be ~400 bytes — way over the limit).
+# Long messages (e.g. a big leaderboard) get split into several sent a few
+# seconds apart instead of failing outright.
+DM_MAX_BYTES = 180             # safe margin under the ~200-233 byte real limit
+DM_CHUNK_PREFIX_RESERVE = 12   # bytes reserved for the "[N/M] " numbering prefix
+DM_CHUNK_DELAY = 5             # seconds between DM chunks (point-to-point, firmware acks/retries)
+BROADCAST_CHUNK_DELAY = 20     # seconds between broadcast chunks — needs to be much longer than
+                                # DM_CHUNK_DELAY: broadcasts are multi-hop/flood-routed with no
+                                # per-recipient ack, and sending the next chunk too soon after the
+                                # first can cause the node to drop the still-in-flight packet.
+
+# ── Answer matching ────────────────────────────────────────────────────────────
+# Phone keyboards routinely mix visually-identical Latin/Cyrillic letters when
+# autocorrecting or switching layouts (e.g. Latin "a" vs Cyrillic "а" — same
+# glyph, different codepoint). A plain string compare treats these as wrong
+# answers, silently, which looks to the user like the bot just isn't
+# responding. Rather than hand-maintaining a list of look-alike letters (which
+# is easy to get wrong or leave gaps in), we use the `confusables` package,
+# which implements the Unicode Consortium's own confusables data (the same
+# reference used for homograph-attack detection) to tell whether two strings
+# are visually indistinguishable, across any script — not just Latin/Cyrillic.
+STRIP_CHARS = string.whitespace + string.punctuation
+
+# ── Schedule Configuration ─────────────────────────────────────────────────────
+QUESTION_HOUR   = 20             # Post daily question at this hour (24h, local time)
+QUESTION_MINUTE = 0              # ... and this minute
+ANSWER_WINDOW   = 3600            # Seconds players have to answer (5 minutes)
+
+# ── Questions Database ─────────────────────────────────────────────────────────
+QUESTIONS = [
+    # Science & Nature
+    ("Химичният символ на златото?", "ау"),
+    ("Коя планета е най-близо до слънцето?", "меркурий"),
+    ("Кой елемент има атомен номер 1?", "водород"),
+    ("Химичният символ на среброто?", "аг"),
+    ("Кой метал е течен при стайна температура?", "живак"),
+    ("Кой газ абсорбират растенията от въздуха?", "въглероден диоксид"),
+    ("Най-голямата планета в Слънчевата система?", "юпитер"),
+    ("Химичният символ на желязото?", "фе"),
+    ("Брой кости в човешкото тяло?", "206"),
+    ("Най-твърд естествен материал?", "диамант"),
+    ("Коя е най-близката звезда до Земята?", "слънце"),
+    ("Химичният символ на натрия?", "на"),
+    ("Скорост на светлината в км/с?", "300000"),
+    ("Брой зъби при възрастен човек?", "32"),
+    ("Химичният символ на кислорода?", "о"),
+    ("Най-големият океан на Земята?", "тихоокеан"),
+    ("Най-големият орган в човешкото тяло?", "кожа"),
+    ("Брой хромозоми при хората?", "46"),
+    ("Най-разпространен газ в атмосферата?", "азот"),
+    ("Символ на хелия?", "хе"),
+    ("Брой планети в Слънчевата система?", "8"),
+    ("Най-бързото сухоземно животно?", "гепард"),
+    ("Химичният символ на калия?", "к"),
+    ("Най-големият бозайник?", "син кит"),
+    ("Какво покрива 71% от Земята?", "вода"),
+    ("Символ на въглерода?", "ц"),
+    ("Най-разпространен елемент във Вселената?", "водород"),
+    ("Температура на кипене на водата (°C)?", "100"),
+    ("Брой елементи в периодичната таблица?", "118"),
+    ("Какъв тип животно е делфинът?", "бозайник"),
+    ("Най-голямата птица в света?", "щраус"),
+    ("Най-дългият орган в човешкото тяло?", "черва"),
+    ("Коя планета се нарича Червената планета?", "марс"),
+    ("Химичен символ на медта?", "ку"),
+    ("Брой ребра в човешкото тяло?", "24"),
+    ("Кое животно снася най-голямото яйце?", "щраус"),
+    ("Най-дълго живеещо животно?", "костенурка"),
+    ("Кой орган филтрира кръвта?", "бъбреци"),
+    ("Кое животно е наречено кралят на джунглата?", "лъв"),
+    ("Химичният символ на оловото?", "пб"),
+    ("Най-бързата риба?", "риба меч"),
+    ("Какво произвеждат пчелите?", "мед"),
+    ("Колко зъба има куче?", "42"),
+    ("Най-високото животно?", "жираф"),
+    ("Коя планета има най-много луни?", "сатурн"),
+    ("Кой орган контролира мислите?", "мозък"),
+    ("Най-лек метал?", "литий"),
+    ("Какво дишат хората?", "кислород"),
+    ("Какво произвеждат растенията при фотосинтеза?", "кислород"),
+    ("Най-студената планета в Слънчевата система?", "нептун"),
+    ("Коя е най-малката кост в човешкото тяло?", "стреме"),
+    ("Най-голямото влечуго?", "крокодил"),
+    ("Кое животно може да сменя цвета си?", "хамелеон"),
+    ("Кое животно има хобот?", "слон"),
+    ("Кой орган изпомпва кръвта?", "сърце"),
+    ("Химичният символ на алуминия?", "ал"),
+    ("Кое животно има най-силна захапка?", "крокодил"),
+    ("Кое животно образува перли?", "мида"),
+    ("Кое животно е символ на България?", "лъв"),
+    ("Кое животно може да лети, но не е птица?", "прилеп"),
+    ("Най-бързият морски бозайник?", "орка"),
+    ("Кое насекомо произвежда храна за човека?", "пчела"),
+    ("Колко литра кръв има в човешкото тяло?", "5"),
+    ("Кое животно може да живее без вода най-дълго?", "камила"),
+    ("Химичен символ на магнезия?", "мг"),
+    ("Най-голямото животно в България?", "мечка"),
+    ("Кое животно може да регенерира крайници?", "морска звезда"),
+    ("Колко млечни зъба има дете?", "20"),
+    ("Коя планета има пръстени?", "сатурн"),
+    ("Химичният символ на калция?", "ка"),
+    ("Кое животно е символ на мъдростта?", "сова"),
+    ("Кое животно може да ходи назад?", "рак"),
+    ("Химичният символ на урана?", "у"),
+    ("Кое животно има синя кръв?", "подковиден рак"),
+    ("Кое е най-малкото птиче?", "колибри"),
+    ("Колко пъти средно бие сърцето за минута?", "72"),
+    ("Кое животно има най-големи уши?", "слон"),
+    ("Химичният символ на никела?", "ни"),
+    ("Кое животно има най-големи очи?", "калмар"),
+    ("Брой сърца на октопод?", "3"),
+    ("Най-дългата река в България?", "дунав"),
+    ("Химичният символ на цинка?", "зн"),
+    ("Химичният символ на фосфора?", "п"),
+    ("Химичният символ на брома?", "бр"),
+    ("Химичният символ на йода?", "и"),
+    ("Химичният символ на хлора?", "хл"),
+    ("Кой е най-твърдият метал?", "хром"),
+    ("Кое е най-малкото бозайниче в света?", "земеровка"),
+    ("Кое животно спи най-малко часове в денонощието?", "жираф"),
+    ("Кое животно спи най-много часове в денонощието?", "коала"),
+    ("Кой е най-отровният паяк в света?", "бразилски скитащ паяк"),
+
+    # History
+    ("Коя година завършва Втората световна война?", "1945"),
+    ("Фамилията на първия президент на САЩ?", "уошингтън"),
+    ("Коя година Америка обявява независимост?", "1776"),
+    ("Кой рисува Мона Лиза?", "да винчи"),
+    ("Коя година потъва Титаник?", "1912"),
+    ("Коя империя строи пирамидите?", "египетска"),
+    ("Коя година започва Първата световна война?", "1914"),
+    ("Кой е първият човек на Луната?", "армстронг"),
+    ("Коя година пада Берлинската стена?", "1989"),
+    ("Кой е момчешкият фараон на Египет?", "тутаанхамон"),
+    ("Коя година Колумб достига Америка?", "1492"),
+    ("Коя държава изобретява хартията?", "китай"),
+    ("Година на Френската революция?", "1789"),
+    ("Кой пише Ромео и Жулиета?", "шекспир"),
+    ("Първата цивилизация в историята?", "шумер"),
+    ("Година на Руската революция?", "1917"),
+    ("Кой построява Великата китайска стена?", "цин"),
+    ("Коя година свършва Гражданската война в САЩ?", "1865"),
+    ("Първият император на Рим?", "август"),
+    ("Кой рисува Сикстинската капела?", "микеланджело"),
+    ("Годината на кацането на Луната?", "1969"),
+    ("Коя империя построява Мачу Пикчу?", "инките"),
+    ("Кой изобретява телефона?", "бел"),
+    ("Коя година е изобретена печатната преса?", "1440"),
+    ("Кой открива гравитацията?", "нютон"),
+    ("Кой е първият европеец достигнал Индия по море?", "гама"),
+    ("Коя е първата жена фараон?", "хатшепсут"),
+    ("Кой изобретява електрическата крушка?", "едисон"),
+    ("Коя година е създаден интернетът?", "1969"),
+    ("Кой е основател на Българската държава?", "аспарух"),
+    ("Коя година е Освобождението на България?", "1878"),
+    ("Коя година е създадена кирилицата?", "863"),
+    ("Кой е първият християнски император на Рим?", "константин"),
+    ("Коя година е падането на Константинопол?", "1453"),
+    ("Кой е първият български владетел приел християнството?", "борис i"),
+    ("Кой е Апостолът на свободата?", "левски"),
+    ("Коя година започва Руско-турската война?", "1877"),
+    ("Кой български владетел е наречен Велики?", "симеон"),
+    ("Коя година е създадена Българската екзархия?", "1870"),
+    ("Кой е последният български цар преди комунизма?", "борис iii"),
+    ("Кой е първият президент на България след 1989?", "желев"),
+    ("Коя година България влиза в ес?", "2007"),
+    ("Кой е авторът на История славянобългарска?", "паисий"),
+    ("Кой е последният фараон на Египет?", "клеопатра"),
+    ("Кой изобретява печатарската машина?", "гутенберг"),
+    ("Коя година е обесването на Васил Левски?", "1873"),
+    ("Коя година е Априлското въстание?", "1876"),
+    ("Кой е българският цар при Клокотница?", "иван асен ii"),
+    ("Коя година е приета Търновската конституция?", "1879"),
+    ("Коя година е Балканската война?", "1912"),
+    ("Кой е цар на България през 1014?", "самуил"),
+    ("Коя година е подписан Санстефанският договор?", "1878"),
+    ("Кой е основателят на ВМРО?", "гоце делчев"),
+    ("Коя година е Съединението на България?", "1885"),
+    ("Кой е цар на България през 1230?", "иван асен ii"),
+    ("Коя година е Ньойският договор?", "1919"),
+    ("Кой е първият славянски книжовник?", "кирил"),
+    ("Кой е първият български космонавт?", "георги иванов"),
+    ("Коя година България пада под османска власт?", "1396"),
+    ("Кой е авторът на Под игото?", "иван вазов"),
+    ("Кой е първият цар на Третата българска държава?", "александър батенберг"),
+    ("Кой е първият премиер на България след Втората световна война?", "георги димитров"),
+    ("Кой български владетел побеждава Византия при Ахелой?", "симеон"),
+    ("Коя година започва Втората световна война?", "1939"),
+    ("Кой е българският цар в края на Първата световна война?", "фердинанд i"),
+
+    # Geography
+    ("Коя е столицата на Франция?", "париж"),
+    ("Коя е столицата на Германия?", "берлин"),
+    ("Коя е столицата на Италия?", "рим"),
+    ("Коя е столицата на Испания?", "мадрид"),
+    ("Коя е столицата на Португалия?", "лисабон"),
+    ("Коя е столицата на Норвегия?", "осло"),
+    ("Коя е столицата на Швеция?", "стокхолм"),
+    ("Коя е столицата на Финландия?", "хелзинки"),
+    ("Коя е столицата на Дания?", "копенхаген"),
+    ("Коя е столицата на Полша?", "варшава"),
+    ("Коя е столицата на Чехия?", "прага"),
+    ("Коя е столицата на Словакия?", "братислава"),
+    ("Коя е столицата на Унгария?", "будапеща"),
+    ("Коя е столицата на Румъния?", "букурещ"),
+    ("Коя е столицата на България?", "софия"),
+    ("Коя е столицата на Гърция?", "атина"),
+    ("Коя е столицата на Турция?", "анкара"),
+    ("Коя е столицата на Русия?", "москва"),
+    ("Коя е столицата на Украйна?", "киев"),
+    ("Коя е столицата на Беларус?", "минск"),
+    ("Коя е столицата на Сърбия?", "белград"),
+    ("Коя е столицата на Хърватия?", "загреб"),
+    ("Коя е столицата на Словения?", "любляна"),
+    ("Коя е столицата на Босна и Херцеговина?", "сараево"),
+    ("Коя е столицата на Черна гора?", "подгорица"),
+    ("Коя е столицата на Албания?", "тирана"),
+    ("Коя е столицата на Македония?", "скопие"),
+    ("Коя е столицата на Австрия?", "виена"),
+    ("Коя е столицата на Швейцария?", "берн"),
+    ("Коя е столицата на Белгия?", "брюксел"),
+    ("Коя е столицата на Нидерландия?", "амстердам"),
+    ("Коя е столицата на Великобритания?", "лондон"),
+    ("Коя е столицата на Ирландия?", "дъблин"),
+    ("Коя е столицата на Исландия?", "реейкявик"),
+    ("Коя е столицата на САЩ?", "вашингтон"),
+    ("Коя е столицата на Канада?", "отава"),
+    ("Коя е столицата на Мексико?", "мексико сити"),
+    ("Коя е столицата на Бразилия?", "бразилия"),
+    ("Коя е столицата на Аржентина?", "буенос айрес"),
+    ("Коя е столицата на Чили?", "сантяго"),
+    ("Коя е столицата на Перу?", "лима"),
+    ("Коя е столицата на Колумбия?", "богота"),
+    ("Коя е столицата на Венецуела?", "каракас"),
+    ("Коя е столицата на Куба?", "хавана"),
+    ("Коя е столицата на Япония?", "токио"),
+    ("Коя е столицата на Китай?", "пекин"),
+    ("Коя е столицата на Южна Корея?", "сеул"),
+    ("Коя е столицата на Индия?", "делхи"),
+    ("Коя е столицата на Пакистан?", "исламабад"),
+    ("Коя е столицата на Афганистан?", "кабул"),
+    ("Коя е столицата на Иран?", "техеран"),
+    ("Коя е столицата на Ирак?", "багдад"),
+    ("Коя е столицата на Сирия?", "дамаск"),
+    ("Коя е столицата на Йордания?", "амман"),
+    ("Коя е столицата на Израел?", "йерусалим"),
+    ("Коя е столицата на Египет?", "кайро"),
+    ("Коя е столицата на Либия?", "триполи"),
+    ("Коя е столицата на Тунис?", "тунис"),
+    ("Коя е столицата на Алжир?", "алжир"),
+    ("Коя е столицата на Мароко?", "рабат"),
+    ("Коя е столицата на Етиопия?", "адис абеба"),
+    ("Коя е столицата на Нигерия?", "абужа"),
+    ("Коя е столицата на Южна Африка?", "претория"),
+    ("Коя е столицата на Кения?", "найроби"),
+    ("Коя е столицата на Австралия?", "канбера"),
+    ("Коя е столицата на Нова Зеландия?", "уелингтън"),
+    ("Коя е столицата на Индонезия?", "джакарта"),
+    ("Коя е столицата на Тайланд?", "бангкок"),
+    ("Коя е столицата на Виетнам?", "ханой"),
+    ("Коя е столицата на Камбоджа?", "пном пен"),
+    ("Коя е столицата на Филипините?", "манила"),
+    ("Коя е столицата на Сингапур?", "сингапур"),
+    ("Коя е столицата на Непал?", "катманду"),
+    ("Коя е столицата на Монголия?", "уланбатор"),
+    ("Коя е столицата на Казахстан?", "астана"),
+    ("Коя е столицата на Узбекистан?", "ташкент"),
+    ("Коя е столицата на Армения?", "ереван"),
+    ("Коя е столицата на Грузия?", "тбилиси"),
+    ("Коя е столицата на Азербайджан?", "бакуу"),
+
+    # Science – formulas, units, concepts
+    ("Коя е химичната формула на водата?", "h2o"),
+    ("Кой е открил закона за гравитацията?", "нютона"),
+    ("Кой е изобретил крушката?", "едисон"),
+    ("Кой е създателят на теорията на относителността?", "айнщайн"),
+    ("Какъв е химичният символ на кислорода?", "о"),
+    ("Какъв е химичният символ на водорода?", "h"),
+    ("Какъв е химичният символ на златото?", "au"),
+    ("Какъв е химичният символ на среброто?", "ag"),
+    ("Какъв е химичният символ на желязото?", "fe"),
+    ("Коя планета е известна като Червената планета?", "марс"),
+    ("Коя е най-голямата планета в Слънчевата система?", "юпитер"),
+    ("Коя е най-близката планета до Слънцето?", "меркурий"),
+    ("Коя е най-далечната планета от Слънцето?", "нептун"),
+    ("Коя е най-близката звезда след Слънцето?", "проксима кентавър"),
+    ("Коя е най-твърдата естествена субстанция?", "диамант"),
+    ("Коя е най-лекият газ?", "водород"),
+    ("Кой е най-тежкият естествен елемент?", "уран"),
+    ("Кой орган изпомпва кръвта в човешкото тяло?", "сърце"),
+    ("Кой орган пречиства кръвта?", "бъбреци"),
+    ("Кой орган контролира тялото и мислите?", "мозък"),
+    ("Кой орган е отговорен за дишането?", "бели дробове"),
+    ("Кой елемент е необходим за дишане?", "кислород"),
+    ("Кой елемент се съдържа в диаманта?", "въглерод"),
+    ("Коя е химичната формула на въглеродния диоксид?", "co2"),
+    ("Коя е химичната формула на метана?", "ch4"),
+    ("Коя е химичната формула на амоняка?", "nh3"),
+    ("Коя е химичната формула на готварската сол?", "nacl"),
+    ("Коя е най-малката частица на елемента?", "атом"),
+    ("Как се наричат отрицателно заредените частици в атома?", "електрони"),
+    ("Как се наричат положително заредените частици в атома?", "протони"),
+    ("Как се наричат неутралните частици в атома?", "неутрони"),
+    ("Кой учен откри електрона?", "томсън"),
+    ("Кой учен откри протона?", "ръдърфорд"),
+    ("Кой учен откри неутрона?", "чадуик"),
+    ("Коя е единицата за електрически ток?", "ампер"),
+    ("Коя е единицата за напрежение?", "волт"),
+    ("Коя е единицата за електрическо съпротивление?", "ом"),
+    ("Коя е единицата за мощност?", "ват"),
+    ("Коя е единицата за енергия?", "джаул"),
+    ("Коя е единицата за сила?", "нютон"),
+    ("Коя е единицата за налягане?", "паскал"),
+    ("Коя е абсолютната нула?", "-273"),
+    ("Кой е създателят на еволюционната теория?", "дарвин"),
+    ("Кое е единственото летящо бозайник?", "прилеп"),
+    ("Коя е най-горещата планета в Слънчевата система?", "венера"),
+    ("Кой газ причинява парников ефект?", "въглероден диоксид"),
+    ("Как се нарича процесът, чрез който растенията произвеждат храна?", "фотосинтеза"),
+    ("Кой органел в клетката извършва фотосинтеза?", "хлоропласт"),
+    ("Кой органел в клетката произвежда енергия?", "митохондрия"),
+    ("Кой учен създаде първата периодична таблица?", "менделеев"),
+    ("Кой е най-разпространеният метал на Земята?", "алуминий"),
+    ("Кой е най-разпространеният елемент във Вселената?", "водород"),
+    ("Коя е най-близката галактика до Млечния път?", "андромеда"),
+    ("Как се нарича нашата галактика?", "млечен път"),
+    ("Коя сила държи планетите в орбита около Слънцето?", "гравитация"),
+
+    # Arithmetic & Math
+    ("Колко е 7 + 8?", "15"),
+    ("Колко е 12 - 5?", "7"),
+    ("Колко е 6 × 9?", "54"),
+    ("Колко е 56 ÷ 7?", "8"),
+    ("Колко е 25 + 36?", "61"),
+    ("Колко е 144 ÷ 12?", "12"),
+    ("Колко е 15 × 15?", "225"),
+    ("Колко е 100 - 47?", "53"),
+    ("Колко е 11 × 11?", "121"),
+    ("Колко е 64 ÷ 8?", "8"),
+    ("Кое е най-малкото просто число?", "2"),
+    ("Колко е 10 на квадрат?", "100"),
+    ("Факториел от 5 е?", "120"),
+    ("Кое е следващото просто число след 11?", "13"),
+    ("Колко е 9 на квадрат?", "81"),
+    ("Колко страни има петоъгълник?", "5"),
+    ("Колко страни има шестоъгълник?", "6"),
+    ("Колко градуса има прав ъгъл?", "90"),
+    ("Колко градуса има пълен ъгъл?", "360"),
+    ("Колко страни има октагон?", "8"),
+    ("Ако влак пътува с 60 км/ч за 2 часа, колко километра ще измине?", "120"),
+    ("Колко е половината от 100?", "50"),
+    ("Колко е една трета от 90?", "30"),
+    ("Ако един хляб струва 2 лв, колко ще струват 7?", "14"),
+    ("Ако часовник показва 3:00, колко градуса е между стрелките?", "90"),
+    ("Ако днес е понеделник, кой ден е след 3 дни?", "четвъртък"),
+    ("Колко са минутите в 3 часа?", "180"),
+    ("НОД на 12 и 18 е?", "6"),
+    ("НОК на 4 и 6 е?", "12"),
+    ("Кое е най-малкото общо кратно на 5 и 7?", "35"),
+    ("Колко е остатъкът при 17 ÷ 3?", "2"),
+    ("Колко е 99 × 99?", "9801"),
+    ("Колко е 123 + 456?", "579"),
+    ("Колко е 789 - 321?", "468"),
+    ("Колко е 25 × 16?", "400"),
+    ("Колко е 2025 ÷ 45?", "45"),
+    ("Колко е 17 × 19?", "323"),
+    ("Колко е 50 × 50?", "2500"),
+    ("Колко е 10% от 200?", "20"),
+    ("Колко е 25% от 80?", "20"),
+    ("Колко е 50% от 90?", "45"),
+    ("Колко е 75% от 120?", "90"),
+    ("Ако цената е 100 и намалее с 20%, новата цена е?", "80"),
+    ("Колко е две трети от 150?", "100"),
+    ("Какво е следващото число: 2, 4, 6, 8, ...?", "10"),
+    ("Какво е следващото число: 1, 1, 2, 3, 5, ...?", "8"),
+    ("Какво е следващото число: 81, 64, 49, 36, ...?", "25"),
+    ("Какво е следващото число: 3, 6, 12, 24, ...?", "48"),
+    ("Какво е следващото число: 1, 4, 9, 16, ...?", "25"),
+    ("Какво е следващото число: 2, 3, 5, 7, 11, ...?", "13"),
+    ("Какво е следващото число: 5, 10, 20, 40, ...?", "80"),
+    ("Какво е следващото число: 8, 16, 32, ...?", "64"),
+
+    # General knowledge
+    ("Колко секунди има в един час?", "3600"),
+    ("Колко минути има в един ден?", "1440"),
+    ("Колко часа има в седмица?", "168"),
+    ("Колко дни има в година?", "365"),
+    ("Колко седмици има в година?", "52"),
+    ("Колко месеца има в 2 години?", "24"),
+    ("Колко десетилетия има в век?", "10"),
+    ("Колко е 2 + 2 × 2?", "6"),
+    ("Колко карти има в стандартно тесте?", "52"),
+    ("Колко струни има китара?", "6"),
+    ("Колко играчи има в отбор по футбол?", "11"),
+    ("Колко дни има февруари в високосна година?", "29"),
+    ("Колко ноти има в музикалната скала?", "7"),
+    ("Колко крака има паяк?", "8"),
+    ("Колко цвята има в дъгата?", "7"),
+    ("Колко дни има декември?", "31"),
+    ("Колко пипала има октопод?", "8"),
+    ("Колко точки има на зар?", "21"),
+    ("Колко квадрата има на шахматната дъска?", "64"),
+    ("Колко часа има в денонощие?", "24"),
+    ("Колко клавиша има на пиано?", "88"),
+    ("Колко дни има септември?", "30"),
+    ("Колко основни цвята има?", "3"),
+    ("Колко лица има куб?", "6"),
+    ("Колко букви има в азбуката?", "26"),
+    ("Колко цента има в един долар?", "100"),
+    ("Колко реда има в хайку?", "3"),
+    ("Колко дни има юни?", "30"),
+    ("Колко колела има на триколка?", "3"),
+    ("Колко зъба има възрастна котка?", "30"),
+    ("Колко грама има в един килограм?", "1000"),
+    ("Колко метра има в един километър?", "1000"),
+    ("Колко сантиметра има в един метър?", "100"),
+    ("Колко милилитра има в един литър?", "1000"),
+    ("При колко градуса по Целзий замръзва водата?", "0"),
+    ("Колко страни има триъгълник?", "3"),
+    ("Колко ъгъла има квадрат?", "4"),
+    ("Колко пръста има на едната ръка?", "5"),
+    ("Колко нули има в едно число милион?", "6"),
+    ("Колко нули има в едно число милиард?", "9"),
+
+    # Technical – Radio & Networking
+    ("Мерна единица за честота?", "херц"),
+    ("Как се съкращава мерната единица херц?", "hz"),
+    ("Колко херца е 1 килохерц?", "1000"),
+    ("Колко херца е 1 мегахерц?", "1000000"),
+    ("С каква скорост се разпространяват радиовълните във вакуум?", "светлината"),
+    ("Как се нарича устройство, което едновременно предава и приема сигнали?", "трансивер"),
+    ("Как се нарича устройство, което само приема радиосигнал?", "приемник"),
+    ("Как се нарича устройство, което само излъчва радиосигнал?", "предавател"),
+    ("Кой елемент на радиостанцията излъчва и приема електромагнитни вълни?", "антена"),
+    ("Как се нарича намаляването на силата на сигнала с разстоянието?", "затихване"),
+    ("Как се нарича смущението между радиосигнали?", "интерференция"),
+    ("Как се нарича безжичната технология с голям обхват, използвана от Meshtastic?", "lora"),
+    ("Какво означава съкращението LoRa на английски?", "long range"),
+    ("Как се нарича мрежовата архитектура, при която всяко устройство препредава сигнала на останалите?", "меш"),
+    ("На каква честота (MHz) обикновено работи Meshtastic в Европа?", "868"),
+    ("На каква честота (MHz) обикновено работи Meshtastic в САЩ?", "915"),
+    ("Как се нарича софтуерът с отворен код за LoRa мрежи, който захранва тази игра?", "meshtastic"),
+    ("Колко бита има един байт?", "8"),
+    ("Как се нарича уникалният адрес на устройство в интернет мрежа?", "ip адрес"),
+    ("Какво означава съкращението IP в компютърните мрежи?", "интернет протокол"),
+    ("Какво означава съкращението LAN?", "локална мрежа"),
+    ("Какво означава съкращението WAN?", "глобална мрежа"),
+    ("Какво означава съкращението VPN?", "виртуална частна мрежа"),
+    ("Какво означава съкращението GPS?", "глобална система за позициониране"),
+    ("Как се нарича устройството, което свързва различни компютърни мрежи?", "рутер"),
+    ("Как се нарича мрежовото устройство, което филтрира трафика за сигурност?", "защитна стена"),
+    ("Колко бита е стандартен IPv4 адрес?", "32"),
+    ("Колко бита е стандартен IPv6 адрес?", "128"),
+    ("Какво означава съкращението USB?", "универсална серийна шина"),
+    ("Какво означава съкращението VHF в радиотехниката?", "много висока честота"),
+    ("Какво означава съкращението UHF в радиотехниката?", "свръхвисока честота"),
+    ("Какво означава съкращението HF в радиотехниката?", "висока честота"),
+    ("Колко канала има Wi-Fi мрежата в 2.4GHz честотния обхват в Европа?", "13"),
+    ("Коя е по-ниската от двете стандартни честоти на Wi-Fi мрежите (GHz)?", "2.4"),
+    ("Коя е по-високата от двете стандартни честоти на Wi-Fi мрежите (GHz)?", "5"),
+    ("Как се нарича лицето, което практикува любителско радио?", "радиолюбител"),
+    ("Кой е международният сигнал за бедствие по морзова азбука?", "sos"),
+    ("Как се нарича логаритмичната единица за измерване силата на сигнала?", "децибел"),
+    ("Как се нарича преобразуването на данни в неразбираем код за защита?", "криптиране"),
+    ("Как се наричат малките части, на които се разделят данните при пренос по мрежа?", "пакети"),
+    ("Какво означава съкращението DNS?", "система за имена на домейни"),
+]
+
+
+class TriviaBot:
+    def __init__(self):
+        self.channel_index = CHANNEL_INDEX
+        self.interface = None
+        self.stats_file = STATS_FILE
+        self.connected = False
+        self.reconnect_interval = 10
+        self.should_run = True
+
+        self.connect()
+
+        # ── Daily question state ───────────────────────────────────────────────
+        self.current_question: Optional[str] = None
+        self.current_answer: Optional[str] = None
+        self.question_start_time: Optional[float] = None
+        self.question_answered: bool = False
+        self.question_lock = threading.Lock()
+        self.timeout_timer: Optional[threading.Timer] = None
+
+        # Track which date the question was already posted, so we never
+        # double-post if the scheduler loop ticks twice in the same minute.
+        self.last_question_date: Optional[date] = None
+
+        self.user_stats: Dict = self.load_stats()
+        print(f"Loaded statistics for {len(self.user_stats)} players")
+
+        # ── Monthly reset state ─────────────────────────────────────────────────
+        self.meta_file = META_FILE
+        self.last_reset_month: Optional[str] = self.load_meta()
+        current_ym = datetime.now().strftime("%Y-%m")
+        if self.last_reset_month is None:
+            # First run ever — nothing to reset, just record the current month.
+            self.last_reset_month = current_ym
+            self.save_meta()
+
+        pub.subscribe(self.on_receive, "meshtastic.receive")
+        print("Subscribed to message events")
+
+        self.questions = QUESTIONS
+
+        # Connection monitor
+        self.monitor_thread = threading.Thread(target=self.monitor_connection, daemon=True)
+        self.monitor_thread.start()
+
+        # Daily scheduler loop
+        self.scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
+        self.scheduler_thread.start()
+
+    # ── Connection ─────────────────────────────────────────────────────────────
+
+    def connect(self) -> bool:
+        try:
+            if self.interface:
+                try:
+                    self.interface.close()
+                except Exception:
+                    pass
+            if CONNECTION_TYPE.lower() == "tcp":
+                print(f"Connecting via TCP to {NODE_IP}...")
+                self.interface = TCPInterface(hostname=NODE_IP)
+            else:
+                print(f"Connecting via Serial to {SERIAL_PORT}...")
+                self.interface = SerialInterface(SERIAL_PORT)
+            time.sleep(2)
+            self.connected = True
+            print("Connection established")
+            return True
+        except Exception as e:
+            print(f"Connection error: {e}")
+            self.connected = False
+            return False
+
+    def monitor_connection(self):
+        while self.should_run:
+            try:
+                if not self.connected:
+                    print("Reconnecting...")
+                    if self.connect():
+                        pub.subscribe(self.on_receive, "meshtastic.receive")
+                    else:
+                        time.sleep(self.reconnect_interval)
+                time.sleep(1)
+            except Exception as e:
+                print(f"Monitor error: {e}")
+                self.connected = False
+                time.sleep(self.reconnect_interval)
+
+    # ── Scheduler ──────────────────────────────────────────────────────────────
+
+    def _scheduler_loop(self):
+        """
+        Wakes every 30 seconds and checks whether it is time to post
+        today's question. Posts at most once per calendar day.
+        """
+        print(f"Scheduler running — daily question at {QUESTION_HOUR:02d}:{QUESTION_MINUTE:02d}")
+        while self.should_run:
+            try:
+                now = datetime.now()
+                today = now.date()
+                if (
+                    now.hour == QUESTION_HOUR
+                    and now.minute == QUESTION_MINUTE
+                    and self.last_question_date != today
+                ):
+                    self.last_question_date = today
+                    self.post_daily_question()
+
+                if MONTHLY_RESET_ENABLED:
+                    current_ym = now.strftime("%Y-%m")
+                    if current_ym != self.last_reset_month:
+                        self.reset_monthly_scoreboard()
+                        self.last_reset_month = current_ym
+                        self.save_meta()
+
+                time.sleep(30)
+            except Exception as e:
+                print(f"Scheduler error: {e}")
+                time.sleep(30)
+
+    # ── Stats persistence ──────────────────────────────────────────────────────
+
+    def load_stats(self) -> Dict:
+        try:
+            if os.path.exists(self.stats_file):
+                with open(self.stats_file, 'r') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            print(f"Error loading stats: {e}")
+            return {}
+
+    def save_stats(self):
+        try:
+            if os.path.exists(self.stats_file):
+                os.replace(self.stats_file, f"{self.stats_file}.backup")
+            with open(self.stats_file, 'w') as f:
+                json.dump(self.user_stats, f, indent=2)
+            bak = f"{self.stats_file}.backup"
+            if os.path.exists(bak):
+                os.remove(bak)
+        except Exception as e:
+            print(f"Error saving stats: {e}")
+            bak = f"{self.stats_file}.backup"
+            if os.path.exists(bak):
+                os.replace(bak, self.stats_file)
+
+    def load_meta(self) -> Optional[str]:
+        """Returns the 'YYYY-MM' of the last scoreboard reset, or None if never recorded."""
+        try:
+            if os.path.exists(self.meta_file):
+                with open(self.meta_file, 'r') as f:
+                    return json.load(f).get("last_reset_month")
+            return None
+        except Exception as e:
+            print(f"Error loading meta: {e}")
+            return None
+
+    def save_meta(self):
+        try:
+            with open(self.meta_file, 'w') as f:
+                json.dump({"last_reset_month": self.last_reset_month}, f, indent=2)
+        except Exception as e:
+            print(f"Error saving meta: {e}")
+
+    def reset_monthly_scoreboard(self):
+        """Announces last month's winner (if any) then wipes the leaderboard for the new month."""
+        print("Performing monthly scoreboard reset...")
+        try:
+            rows = [
+                (nid, s.get("wins", 0), s["total_time"] / s["wins"])
+                for nid, s in self.user_stats.items()
+                if s.get("wins", 0) > 0
+            ]
+            if rows:
+                rows.sort(key=lambda x: (-x[1], x[2]))
+                winner_id, winner_wins, winner_avg = rows[0]
+                self.broadcast(
+                    f"📅 Нов месец, ново класиране! Победител на миналия месец: "
+                    f"{winner_id} с {winner_wins} победи (avg {winner_avg:.1f}s). Успех на всички! 🎉"
+                )
+        except Exception as e:
+            print(f"Error announcing monthly winner: {e}")
+
+        # Wipe per-player win counters for the new month, keep identity fields.
+        for s in self.user_stats.values():
+            self._migrate_record(s)
+            s["wins"] = 0
+            s["total_time"] = 0.0
+            s["fastest_time"] = float("inf")
+        self.save_stats()
+        print("Monthly scoreboard reset complete.")
+
+    # ── Messaging ──────────────────────────────────────────────────────────────
+
+    def broadcast(self, message: str):
+        """Send to the primary channel — visible to everyone. Auto-splits if too long."""
+        chunks = self._chunk_message(message)
+        if len(chunks) <= 1:
+            self._broadcast_raw(message)
+        else:
+            threading.Thread(
+                target=self._broadcast_chunks, args=(chunks,), daemon=True
+            ).start()
+
+    def _broadcast_chunks(self, chunks: List[str]):
+        total = len(chunks)
+        for i, chunk in enumerate(chunks, 1):
+            self._broadcast_raw(f"[{i}/{total}] {chunk}")
+            if i < total:
+                time.sleep(BROADCAST_CHUNK_DELAY)
+
+    def _broadcast_raw(self, message: str):
+        try:
+            if not self.connected:
+                print("Cannot broadcast: not connected")
+                return
+            print(f"BROADCAST: {message}")
+            self.interface.sendText(message, channelIndex=self.channel_index)
+        except Exception as e:
+            print(f"Broadcast error: {e}")
+            self.connected = False
+
+    def send_dm(self, message: str, to_node: str):
+        """Send a private message to one node only.
+
+        If the message is too big for a single Meshtastic packet, it's split
+        into several messages and sent DM_CHUNK_DELAY seconds apart (in a
+        background thread, so it doesn't block message handling).
+        """
+        chunks = self._chunk_message(message)
+        if len(chunks) <= 1:
+            self._send_dm_raw(message, to_node)
+        else:
+            threading.Thread(
+                target=self._send_dm_chunks, args=(chunks, to_node), daemon=True
+            ).start()
+
+    def _send_dm_chunks(self, chunks: List[str], to_node: str):
+        total = len(chunks)
+        for i, chunk in enumerate(chunks, 1):
+            self._send_dm_raw(f"[{i}/{total}] {chunk}", to_node)
+            if i < total:
+                time.sleep(DM_CHUNK_DELAY)
+
+    def _send_dm_raw(self, message: str, to_node: str):
+        try:
+            if not self.connected or not to_node:
+                return
+            node_num = (
+                int(to_node[1:], 16) if to_node.startswith('!') else int(to_node, 16)
+            )
+            self.interface.sendText(message, node_num, channelIndex=self.channel_index)
+        except Exception as e:
+            print(f"DM error to {to_node}: {e}")
+            self.connected = False
+
+    def _chunk_message(self, message: str, max_bytes: int = DM_MAX_BYTES - DM_CHUNK_PREFIX_RESERVE) -> List[str]:
+        """Split a message into pieces that each fit under max_bytes (UTF-8 encoded
+        byte count — Meshtastic's real limit is on bytes, not characters), preferring
+        to break on line boundaries, falling back to word boundaries for any single
+        line that's too long on its own. max_bytes is pre-shrunk to leave room for
+        the "[N/M] " prefix added when a message is actually split."""
+        chunks: List[str] = []
+        current = ""
+
+        def fits(s: str) -> bool:
+            return len(s.encode('utf-8')) <= max_bytes
+
+        for line in message.split("\n"):
+            candidate = f"{current}\n{line}" if current else line
+            if fits(candidate):
+                current = candidate
+                continue
+
+            if current:
+                chunks.append(current)
+                current = ""
+
+            if fits(line):
+                current = line
+                continue
+
+            # Single line is itself too long — split on words.
+            for word in line.split(" "):
+                candidate2 = f"{current} {word}" if current else word
+                if fits(candidate2):
+                    current = candidate2
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = word
+
+        if current:
+            chunks.append(current)
+
+        return chunks or [message]
+
+    # ── Question management ────────────────────────────────────────────────────
+
+    def post_daily_question(self):
+        """Post one random question to the channel. Called once per day by the scheduler."""
+        with self.question_lock:
+            # Cancel any leftover timer from a previous unanswered question
+            if self.timeout_timer and self.timeout_timer.is_alive():
+                self.timeout_timer.cancel()
+
+            question, answer = random.choice(self.questions)
+            self.current_question = question
+            self.current_answer = answer
+            self.question_start_time = time.time()
+            self.question_answered = False
+
+            print(f"Daily question: {question}  [answer: {answer}]")
+            self.broadcast(f"🧠 {question} ({ANSWER_WINDOW // 60}м)")
+
+            # Silent timeout — no announcement, just close the window
+            self.timeout_timer = threading.Timer(
+                ANSWER_WINDOW, self._close_question_silently, args=[question, answer]
+            )
+            self.timeout_timer.daemon = True
+            self.timeout_timer.start()
+
+    def _close_question_silently(self, question: str, answer: str):
+        """Time window expired and nobody answered — close quietly, no channel message."""
+        with self.question_lock:
+            if self.question_answered:
+                return
+            if self.current_question != question or self.current_answer != answer:
+                return
+            self.question_answered = True
+            self.current_question = None
+            self.current_answer = None
+        # No broadcast — complete silence on timeout
+        print(f"Question timed out unanswered: {question}  (answer was: {answer})")
+
+    def _answers_match(self, submitted: str, correct: str) -> bool:
+        """True if submitted answer matches correct answer exactly OR is a
+        visual homoglyph confusable of it (see STRIP_CHARS block above)."""
+        a = submitted.strip(STRIP_CHARS).lower()
+        b = correct.strip(STRIP_CHARS).lower()
+        if a == b:
+            return True
+        if not a or not b:
+            return False
+        return is_confusable(a, b) is not False
+
+    def try_answer(self, from_node: str, message: str) -> bool:
+        """
+        Check whether *message* is the correct answer to today's open question.
+        Only the FIRST correct answer counts. Wrong answers are ignored silently.
+        """
+        with self.question_lock:
+            if self.current_question is None:
+                return False
+            if not self._answers_match(message, self.current_answer):
+                return False  # Wrong answer — complete silence
+
+            # ── Correct! ──────────────────────────────────────────────────────
+            elapsed = time.time() - self.question_start_time
+
+            # Flag first so _close_question_silently backs off even if already running
+            self.question_answered = True
+
+            if self.timeout_timer and self.timeout_timer.is_alive():
+                self.timeout_timer.cancel()
+
+            answered_question = self.current_question
+            self.current_question = None
+            self.current_answer = None
+
+        # Stats and announcement outside the lock
+        self.update_stats(from_node, response_time=elapsed)
+        self.broadcast(
+            f"✅ {from_node} отговори правилно на въпроса на деня за {elapsed:.1f}с! "
+            f"Браво! Следващ въпрос утре в {QUESTION_HOUR:02d}:{QUESTION_MINUTE:02d}."
+        )
+        return True
+
+    # ── Stats & leaderboard ────────────────────────────────────────────────────
+
+    def _migrate_record(self, s: dict):
+        """Ensure a stats record has v3 keys, migrating from v2 if needed."""
+        if "wins" not in s:
+            s["wins"] = s.get("correct_answers", 0)
+        if "last_win" not in s:
+            s["last_win"] = s.get("last_played", datetime.now().isoformat())
+        if "fastest_time" not in s:
+            s["fastest_time"] = float("inf")
+        if "total_time" not in s:
+            s["total_time"] = 0.0
+        if "first_seen" not in s:
+            s["first_seen"] = datetime.now().isoformat()
+
+    def update_stats(self, node_id: str, response_time: float):
+        if not node_id:
+            return
+        if node_id not in self.user_stats:
+            self.user_stats[node_id] = {
+                "wins": 0,
+                "total_time": 0.0,
+                "fastest_time": float("inf"),
+                "first_seen": datetime.now().isoformat(),
+                "last_win": datetime.now().isoformat(),
+            }
+        s = self.user_stats[node_id]
+        self._migrate_record(s)  # handles old v2 records missing "wins" key
+        s["wins"] += 1
+        s["total_time"] += response_time
+        s["fastest_time"] = min(s["fastest_time"], response_time)
+        s["last_win"] = datetime.now().isoformat()
+        self.save_stats()
+
+    def get_leaderboard(self) -> str:
+        rows = [
+            (nid, s["wins"], s["total_time"] / s["wins"])
+            for nid, s in self.user_stats.items()
+            if s.get("wins", 0) > 0
+        ]
+        if not rows:
+            return "🏆 Все още няма класиране!"
+        rows.sort(key=lambda x: (-x[1], x[2]))
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        lines = ["🏆 Топ класация 🏆"]
+        for i, (nid, wins, avg) in enumerate(rows[:10], 1):
+            prefix = medals.get(i, f"{i}.")
+            lines.append(f"{prefix} {nid}: {wins} победи (avg {avg:.1f}s)")
+        return "\n".join(lines)
+
+    def get_personal_stats(self, node_id: str) -> str:
+        if not node_id or node_id not in self.user_stats:
+            return "Нямаш победи все още. Отговори на въпроса на деня!"
+        s = self.user_stats[node_id]
+        wins = s["wins"]
+        avg = s["total_time"] / wins if wins > 0 else 0
+        fastest = s["fastest_time"] if s["fastest_time"] != float('inf') else 0
+        rank = self._player_rank(node_id)
+        rank_str = f" | #{rank} в класацията" if rank else ""
+        first = datetime.fromisoformat(s["first_seen"]).strftime('%Y-%m-%d')
+        return (
+            f"📊 Твоята статистика{rank_str}\n"
+            f"Победи: {wins}\n"
+            f"Среден: {avg:.1f}s | Рекорд: {fastest:.1f}s\n"
+            f"Играеш от: {first}"
+        )
+
+    def _player_rank(self, node_id: str) -> int:
+        rows = [
+            (nid, s["wins"], s["total_time"] / s["wins"])
+            for nid, s in self.user_stats.items()
+            if s.get("wins", 0) > 0
+        ]
+        rows.sort(key=lambda x: (-x[1], x[2]))
+        for i, (nid, _, _) in enumerate(rows, 1):
+            if nid == node_id:
+                return i
+        return 0
+
+    # ── Incoming messages ──────────────────────────────────────────────────────
+
+    def on_receive(self, packet, interface):
+        try:
+            if 'decoded' not in packet:
+                return
+            if packet['decoded'].get('portnum') != 'TEXT_MESSAGE_APP':
+                return
+
+            message = packet['decoded']['payload'].decode('utf-8').strip()
+            from_node = packet.get('fromId')
+            if not from_node:
+                return
+
+            print(f"From {from_node}: {message}")
+            cmd = message.upper()
+
+            if cmd == 'TOP':
+                self.send_dm(self.get_leaderboard(), from_node)
+                return
+
+            if cmd in ('STATS', 'L'):
+                self.send_dm(self.get_personal_stats(from_node), from_node)
+                return
+
+            if cmd == 'HELP':
+                self.send_dm(
+                    "Команди:\n"
+                    "TOP  — виж класацията (лично)\n"
+                    "STATS — твоята статистика (лично)\n"
+                    "Всеки ден в 20:00 се пуска въпрос.\n"
+                    "Пиши отговора директно в канала!",
+                    from_node
+                )
+                return
+
+            # Everything else is a potential answer
+            self.try_answer(from_node, message)
+
+        except Exception as e:
+            print(f"on_receive error: {e}")
+            import traceback
+            print(traceback.format_exc())
+
+    # ── Cleanup ────────────────────────────────────────────────────────────────
+
+    def cleanup(self):
+        self.should_run = False
+        if self.timeout_timer and self.timeout_timer.is_alive():
+            self.timeout_timer.cancel()
+        if self.interface:
+            try:
+                self.interface.close()
+            except Exception:
+                pass
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main():
+    bot = None
+    try:
+        print("Initializing TriviaBot v3.0 (daily question mode)...")
+        bot = TriviaBot()
+        print(
+            f"Running | "
+            f"{'TCP @ ' + NODE_IP if CONNECTION_TYPE.lower() == 'tcp' else 'Serial @ ' + SERIAL_PORT} | "
+            f"{len(QUESTIONS)} questions | "
+            f"Daily at {QUESTION_HOUR:02d}:{QUESTION_MINUTE:02d} | "
+            f"Answer window: {ANSWER_WINDOW // 60} min"
+        )
+        if bot.interface:
+            try:
+                info = bot.interface.getMyNodeInfo()
+                print(f"Node ID: {info.get('num', 'Unknown')}")
+            except Exception as e:
+                print(f"Could not get node info: {e}")
+
+        print("Ctrl+C to quit")
+        while True:
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        import traceback
+        print(traceback.format_exc())
+    finally:
+        if bot:
+            bot.cleanup()
+            print("Done.")
+
+
+if __name__ == "__main__":
+    main()
