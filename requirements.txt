@@ -1,0 +1,4 @@
+meshtastic
+pyserial
+pypubsub
+confusables
